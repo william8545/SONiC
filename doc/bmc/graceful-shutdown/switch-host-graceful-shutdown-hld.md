@@ -43,6 +43,7 @@
 | Rev | Date | Author | Change Description |
 | --- | --- | --- | --- |
 | 0.1 | 2026-08-12 | William Tsai | Initial version |
+| 0.2 | 2026-08-28 | William Tsai | Clarify ordered, identity-scoped HALT completion timeout selection |
 
 ### 2. Scope
 
@@ -162,7 +163,7 @@ The only new traffic on the BMC-host link is gNOI over mTLS.
 | --- | --- | --- |
 | `bmcctld` | sonic-platform-daemons | Send `HALT`, poll `RebootStatus`, remove power on every outcome it handles, add `GRACEFUL_RESTART`, add the priority handling of [§7.6](#76-concurrency-and-preemption) |
 | `scripts/reboot` | sonic-utilities | Accept `-p` on a switch-host. Today the option is DPU-only |
-| `host_modules/reboot.py` | sonic-host-services | Report failure when a completion check cannot be answered, carry the requester's tag on every terminal report, read `switch_host_halt_services_timeout`, and write the graceful reboot cause after the check |
+| `host_modules/reboot.py` | sonic-host-services | Report failure when a completion check cannot be answered, carry the requester's tag on every terminal report, select the HALT completion timeout by device identity, and write the graceful reboot cause after the check |
 | `show chassis modules status` | sonic-utilities | New status columns |
 | `determine-reboot-cause` | sonic-host-services | The one display rule of [§7.7](#77-reboot-cause) |
 | mTLS material | sonic-buildimage | Certificate seeding on opted-in platforms |
@@ -217,10 +218,10 @@ sequenceDiagram
 pre-shutdown; it is currently rejected on anything that is not a DPU, and this design allows it on an
 opted-in switch-host. Nothing in the teardown itself changes.
 
-Relaxing that rejection is not by itself enough on a switch-host that is also a SmartSwitch NPU: the same
-entry point otherwise continues into the path that reboots the NPU's DPUs, whose own status wait reads the
-same `platform.json` key. On an opted-in switch-host it returns to the pre-shutdown body instead, and the
-DPU legs are not driven from here.
+The same script entry point also owns the existing SmartSwitch NPU reboot flow, which reboots the NPU's DPUs
+and waits for them using `dpu_halt_services_timeout`. The opted-in switch-host `-p` branch bypasses those DPU
+legs and returns to the pre-shutdown body. A non-opted-in, non-DPU `-p` request is still rejected before the
+residual completion window opens, as it is today.
 
 ```mermaid
 flowchart LR
@@ -375,7 +376,7 @@ adds rather than guarantees it inherits. The host is ready to lose power, not sh
 | `graceful_shutdown_timeout` | `bmcctld` uses `0`, which means forced; the parent design documents 120 s | Existing field, but the two disagree — see below. It is the binding bound: the whole pre-shutdown is spent inside it |
 | Pre-shutdown duration | To be measured | New measurement. It decides whether 120 s is enough |
 | Reboot-backend halt wait | `260 s` | Existing `sonic-sysmgr` constant, compiled into the *host* image. After it the host's report is unreachable — the ceiling in rule 1 |
-| Residual completion check | 0 s when its window opens satisfied; otherwise up to `switch_host_halt_services_timeout`, rounded up to its 5 s poll, plus one probe. When that key is absent the existing `dpu_halt_services_timeout` applies, and only then a `60 s` default — so on a platform that sets the DPU key this term is that value, not 60 s ([§9.3](#93-config-db-enhancements)) | Existing mechanism, read on any `HALT`. It starts only after `reboot -p` exits, so it bounds the residual check and not the teardown — a conditional worst-case term in rule 1 |
+| Residual completion check | 0 s when its window opens satisfied; otherwise up to the timeout selected by positive device identity, rounded up to its 5 s poll, plus one probe. Selection is ordered: a switch-host reads only `switch_host_halt_services_timeout`; otherwise a SmartSwitch or DPU reads only `dpu_halt_services_timeout`; an absent, invalid, or non-positive selected value uses `60 s` ([§9.3](#93-config-db-enhancements)) | Existing mechanism with role-scoped timeout selection, read after a successful `reboot -p` on either HALT role. It bounds the residual check and not the teardown — a conditional worst-case term in rule 1 |
 | Watchdog | Requested 180 s; the effective value is whatever the platform returns | Existing `watchdogutil arm` |
 | `RebootStatus` poll interval | 1 s, proposed | New constant. It bounds how late a result is noticed, and it spends the timeout |
 | Restart pause | 3 s, proposed | New constant |
@@ -704,7 +705,7 @@ sets it.
 | --- | --- |
 | New BMC, old host image | The host rejects `-p` within seconds, but its failure report carries no tag, so the BMC cannot attribute it and waits out the timeout before removing power |
 | New BMC, new host image, pre-shutdown refuses early | The failure report carries the tag, so the BMC acts on it in seconds ([§12](#12-restrictionslimitations) item 3) |
-| Old BMC, new host image | The BMC never sends `HALT`, so the switch-host path never runs. `reboot.py`'s tag change is shared with the DPU path, which is asserted unchanged ([§13.2](#132-system-test-cases)) |
+| Old BMC, new host image | The BMC never sends `HALT`, so the switch-host path never runs. `reboot.py`'s tag and identity-scoped timeout changes are shared with the DPU path, whose timeout selection and behavior are asserted unchanged ([§13.1](#131-unit-test-cases), [§13.2](#132-system-test-cases)) |
 | Either side unprovisioned | Forced-only, which is today's behavior |
 
 No merge order is required across the repositories; every mixed combination falls back to forced.
@@ -789,16 +790,19 @@ none.
 ```
 bmc_pairing                       = true      ; this platform passed the checks in 7.9
 switch_host_halt_services_timeout = <secs>    ; bounds the host's residual completion check for a
-                                              ; switch-host HALT. Falls back to the existing
-                                              ; dpu_halt_services_timeout, then to its own 60 s default
+                                              ; positively identified switch-host HALT. An absent,
+                                              ; invalid or non-positive value uses the 60 s default;
+                                              ; it never falls back to the DPU timeout
 ```
 
-The second key exists because the switch-host's residual bound has to be sized for this host, and the shared
-DPU-named one cannot be. The only platform that sets it uses 180 s for its DPUs, which charged as rule 1's
-residual term leaves under 75 s of the ceiling for everything else; lowering it is not the alternative, because
-the same value bounds an NPU's wait for its DPUs, the `halt_services` module transition and the requester
-daemon's poll, so lowering it retimes the DPU legs instead. Only the *value* is open, in open item 1. Whether
-any BMC-paired platform is also a smart switch is not established here.
+The timeout reader selects one key from positive device identity in this order: a switch-host reads only
+`switch_host_halt_services_timeout`; otherwise a SmartSwitch, then a DPU, reads only the existing
+`dpu_halt_services_timeout`; every other identity uses 60 s. A missing, unreadable, invalid or non-positive
+selected value also uses 60 s and never causes a cross-role fallback. Testing switch-host first resolves a
+device that is also a SmartSwitch toward the switch-host HALT path. The switch-host key exists because its
+residual bound has to be sized independently from the DPU legs. Selection occurs only after `reboot -p`
+returns success; a non-opted-in, non-DPU request is rejected before this residual window. Only the *value*
+is open, in open item 1.
 
 On the host, the existing `GNMI` tables gain the certificate material and `client_auth`, seeded at
 runtime on opted-in platforms only — never from build-time `init_cfg.json`, which cannot be per
@@ -884,6 +888,10 @@ Against injected fakes, asserting the outcome, the state sequence and the power 
 
 - **Happy paths** — graceful shutdown; graceful restart; host already off.
 - **No graceful leg** — `timeout = 0`; platform not opted in; no certificates.
+- **HALT completion timeout selection** — switch-host identity takes precedence and reads only
+  `switch_host_halt_services_timeout`; otherwise SmartSwitch and DPU identities read only
+  `dpu_halt_services_timeout`; every other identity and any missing, unreadable, invalid or non-positive
+  selected value use 60 s without consulting the other role's key.
 - **Degraded to forced** — host rejects `-p`; host never answers or answers late; RPC fails; a reboot
   already in flight; a completion check that cannot be answered. Every one of these must end forced,
   never graceful.
